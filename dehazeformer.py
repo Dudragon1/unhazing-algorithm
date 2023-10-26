@@ -374,6 +374,90 @@ class PatchUnEmbed(nn.Module):
 		x = self.proj(x)
 		return x
 
+####################################
+# GLASM--下采样机制
+class Downsample(nn.Module):
+    def __init__(self, dim, num_head=8, bias=False):
+        super().__init__()
+        self.num_head = num_head
+        self.temperature = nn.Parameter(torch.ones(num_head, 1, 1))
+        # 普通下采样
+        self.v = nn.Sequential(
+            nn.Conv2d(dim, dim, kernel_size=3, stride=2, padding=1, bias=bias),
+            LayerNorm(dim),
+            nn.Conv2d(dim, dim * 2, kernel_size=1, bias=bias)
+        )
+        self.v_hp = nn.Conv2d(dim * 2, dim * 2, kernel_size=3, stride=1, padding=1, groups=dim, bias=bias)
+        self.qk = nn.Conv2d(dim, dim * 4, kernel_size=1, bias=bias)
+        self.proj = nn.Conv2d(dim * 2, dim * 2, kernel_size=1, bias=bias)
+
+    def forward(self, x):
+        # 定义下采样后的shape
+        B, C, H, W = x.shape
+        out_shape = B, C * 2, H // 2, W // 2
+
+        # 通过卷积和转置获得[q, k]
+        qk = self.qk(x).reshape(B, 2, self.num_head, (C * 2) // self.num_head, -1).transpose(0, 1)
+        q, k = qk[0], qk[1]
+        # 常规卷积下采样，再通过
+        v = self.v(x)
+        v_hp = self.v_hp(v)
+        v = v.reshape(B, self.num_head, (C * 2) // self.num_head, -1)
+
+        attn = (q @ k.transpose(-1, -2)) * self.temperature
+        attn = attn.softmax(dim=-1)
+        x = (attn @ v).reshape(out_shape) + v_hp
+        x = self.proj(x)
+        return x
+
+# GLASM--上采样机制
+class Upsample(nn.Module):
+    def __init__(self, dim, num_head=8, bias=False):
+        super().__init__()
+        self.num_head = num_head
+        self.temperature = nn.Parameter(torch.ones(num_head, 1, 1))
+
+        self.v = nn.Sequential(
+            nn.ConvTranspose2d(dim, dim, kernel_size=4, stride=2, padding=1, bias=bias),
+            LayerNorm(dim),
+            nn.Conv2d(dim, dim // 2, kernel_size=1, bias=False)
+        )
+        self.v_hp = nn.Conv2d(dim // 2, dim // 2, kernel_size=3, stride=1, padding=1, groups=dim // 2, bias=False)
+        self.qk = nn.Conv2d(dim, dim, kernel_size=1, bias=False)
+        self.proj = nn.Conv2d(dim // 2, dim // 2, kernel_size=1, bias=False)
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        out_shape = B, C // 2, H * 2, W * 2
+
+        qk = self.qk(x).reshape(B, 2, self.num_head, (C // 2) // self.num_head, -1).transpose(0, 1)
+        q, k = qk[0], qk[1]
+
+        v = self.v(x)
+        v_hp = self.v_hp(v)
+        v = v.reshape(B, self.num_head, (C // 2) // self.num_head, -1)
+
+        attn = (q @ k.transpose(-1, -2)) * self.temperature
+        attn = attn.softmax(dim=-1)
+        x = (attn @ v).reshape(out_shape) + v_hp
+        x = self.proj(x)
+        return x
+
+
+class LayerNorm(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.bias = nn.Parameter(torch.zeros(dim))
+        self.eps = 1e-6
+
+    def forward(self, x):
+        u = x.mean(1, keepdim=True)
+        s = (x - u).pow(2).mean(1, keepdim=True)
+        x = (x - u) / torch.sqrt(s + self.eps)
+        x = self.weight[:, None, None] * x + self.bias[:, None, None]
+        return x
+
 #################################################
 # 选择融合机制
 class SKFusion(nn.Module):
@@ -405,6 +489,7 @@ class SKFusion(nn.Module):
 
 		out = torch.sum(in_feats*attn, dim=1)
 		return out
+
 ##############################
 # SKFF
 class SKFF(nn.Module):
@@ -475,8 +560,10 @@ class DehazeFormer(nn.Module):
 					   			 attn_ratio=attn_ratio[0], attn_loc='last', conv_type=conv_type[0])
 
 		# 下采样 [B, embed_dims[0], H, W] --> [B, embed_dims[1], H, W]
-		self.patch_merge1 = PatchEmbed(
-			patch_size=2, in_chans=embed_dims[0], embed_dim=embed_dims[1])
+		# 	self.patch_merge1 = PatchEmbed(
+		# 	patch_size=2, in_chans=embed_dims[0], embed_dim=embed_dims[1])
+		self.patch_merge1 = Downsample(
+			dim=embed_dims[0], num_head=8)
 
 		self.skip1 = nn.Conv2d(embed_dims[0], embed_dims[0], 1)
 
@@ -485,8 +572,10 @@ class DehazeFormer(nn.Module):
 								 norm_layer=norm_layer[1], window_size=window_size,
 								 attn_ratio=attn_ratio[1], attn_loc='last', conv_type=conv_type[1])
 
-		self.patch_merge2 = PatchEmbed(
-			patch_size=2, in_chans=embed_dims[1], embed_dim=embed_dims[2])
+		# self.patch_merge2 = PatchEmbed(
+		# 	patch_size=2, in_chans=embed_dims[1], embed_dim=embed_dims[2])
+		self.patch_merge2 = Downsample(
+			dim=embed_dims[1], num_head=8)
 
 		self.skip2 = nn.Conv2d(embed_dims[1], embed_dims[1], 1)
 
@@ -495,8 +584,11 @@ class DehazeFormer(nn.Module):
 								 norm_layer=norm_layer[2], window_size=window_size,
 								 attn_ratio=attn_ratio[2], attn_loc='last', conv_type=conv_type[2])
 
-		self.patch_split1 = PatchUnEmbed(
-			patch_size=2, out_chans=embed_dims[3], embed_dim=embed_dims[2])
+		# self.patch_split1 = PatchUnEmbed(
+		# 	patch_size=2, out_chans=embed_dims[3], embed_dim=embed_dims[2])
+
+		self.patch_split1 = Upsample(
+			dim=embed_dims[2], num_head=8)
 
 		assert embed_dims[1] == embed_dims[3]
 		self.fusion1 = SKFusion(embed_dims[3])
@@ -506,8 +598,11 @@ class DehazeFormer(nn.Module):
 								 norm_layer=norm_layer[3], window_size=window_size,
 								 attn_ratio=attn_ratio[3], attn_loc='last', conv_type=conv_type[3])
 
-		self.patch_split2 = PatchUnEmbed(
-			patch_size=2, out_chans=embed_dims[4], embed_dim=embed_dims[3])
+		# self.patch_split2 = PatchUnEmbed(
+		# 	patch_size=2, out_chans=embed_dims[4], embed_dim=embed_dims[3])
+
+		self.patch_split2 = Upsample(
+			dim=embed_dims[3], num_head=8)
 
 		assert embed_dims[0] == embed_dims[4]
 		self.fusion2 = SKFusion(embed_dims[4])			
@@ -520,15 +615,23 @@ class DehazeFormer(nn.Module):
 		# merge non-overlapping patches into image
 		self.patch_unembed = PatchUnEmbed(
 			patch_size=1, out_chans=out_chans, embed_dim=embed_dims[4], kernel_size=3)
+		#
 
+		#######################
+		# Block-Refin
+		self.refine = nn.Sequential(BasicLayer(network_depth=sum(depths), dim=embed_dims[4], depth=depths[4],
+								 				num_heads=num_heads[4], mlp_ratio=mlp_ratios[4],
+								 				norm_layer=norm_layer[4], window_size=window_size,
+								 				attn_ratio=attn_ratio[4], attn_loc='last', conv_type=conv_type[4]),
+									self.patch_unembed)
 
-	def check_image_size(self, x):
-		# NOTE: for I2I test
-		_, _, h, w = x.size()
-		mod_pad_h = (self.patch_size - h % self.patch_size) % self.patch_size
-		mod_pad_w = (self.patch_size - w % self.patch_size) % self.patch_size
-		x = F.pad(x, (0, mod_pad_w, 0, mod_pad_h), 'reflect')
-		return x
+	# def check_image_size(self, x):
+	# 	# NOTE: for I2I test
+	# 	_, _, h, w = x.size()
+	# 	mod_pad_h = (self.patch_size - h % self.patch_size) % self.patch_size
+	# 	mod_pad_w = (self.patch_size - w % self.patch_size) % self.patch_size
+	# 	x = F.pad(x, (0, mod_pad_w, 0, mod_pad_h), 'reflect')
+	# 	return x
 
 	def forward_features(self, x):
 		x = self.patch_embed(x)
