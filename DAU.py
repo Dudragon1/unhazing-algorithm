@@ -69,6 +69,39 @@ class ca_layer(nn.Module):
 
 
 ##########################################################################
+## --ECA--
+class Eca_layer(nn.Module):
+    def __init__(self, channel, reduction=1, bias=True):
+        super(Eca_layer, self).__init__()
+        # global average pooling: feature --> point
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        # feature channel downscale and upscale --> channel weight
+        self.conv_du1 = nn.Sequential(
+            nn.Conv2d(channel, channel // reduction, 1, padding=0, bias=bias),
+            nn.ReLU(inplace=True),
+        )
+        self.conv_du2 = nn.Sequential(
+            nn.Conv2d(channel // reduction, channel, 1, padding=0, bias=bias),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        y = self.avg_pool(x)    # y:[B, C, 1, 1]
+        ############
+        y = y.squeeze(-1)  # y:[B, C, 1]
+        Ty = y.permute(0, 2, 1)  # Ty:[B, 1, C]
+        Ny = torch.matmul(y, Ty)  # Ny:[B, 1, 1]
+        batch = Ny.shape[0]
+        v = Ny.squeeze(-1).permute(1, 0).expand((self.feature_channel, batch))  # [B, 1, 1]-->[B, 1]-->[1, B]-->[C, B]
+        v = v.unsqueeze_(-1).permute(1, 2, 0)  # [C, B]-->[C, B, 1]-->[B, 1, C]
+        v_GC = v.transpose(2, 1).unsqueeze(-1)  # [B, 1, C, 1]-->[B, C, 1, 1]
+        ############
+        y = self.conv_du1(y) + v_GC
+        y = self.conv_du2(y)
+        return x * y
+
+
+##########################################################################
 ##---------- Dual Attention Unit (DAU) ----------
 class DAU(nn.Module):
     def __init__(
