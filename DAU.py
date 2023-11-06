@@ -90,7 +90,7 @@ class Eca_layer(nn.Module):
         ############
         y = y.squeeze(-1)  # y:[B, C, 1]
         Ty = y.permute(0, 2, 1)  # Ty:[B, 1, C]
-        Ny = torch.matmul(y, Ty)  # Ny:[B, 1, 1]
+        Ny = torch.matmul(y, Ty)  # Ny:[B, 24, 24]
         batch = Ny.shape[0]
         v = Ny.squeeze(-1).permute(1, 0).expand((self.feature_channel, batch))  # [B, 1, 1]-->[B, 1]-->[1, B]-->[C, B]
         v = v.unsqueeze_(-1).permute(1, 2, 0)  # [C, B]-->[C, B, 1]-->[B, 1, C]
