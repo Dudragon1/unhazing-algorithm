@@ -1,0 +1,39 @@
+import to_2tuple
+
+class PIFM(nn.Module):
+    def __init__(self, channel, reduction=8, bias=False):
+        super(PIFM, self).__init__()
+
+        hidden_features = int(channel // reduction)
+
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.a = nn.Sequential(
+            nn.Conv2d(channel, hidden_features, kernel_size=to_2tuple(1), bias=bias),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden_features, channel * 2, kernel_size=to_2tuple(1), bias=bias),
+            nn.Softmax(dim=1)
+        )
+        self.t = nn.Sequential(
+            nn.Conv2d(channel, channel, kernel_size=to_2tuple(3), padding=1, groups=channel, bias=bias),
+            nn.Conv2d(channel, hidden_features, kernel_size=to_2tuple(1), bias=bias),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden_features, channel * 2, kernel_size=to_2tuple(1), bias=bias),
+            nn.Sigmoid()
+        )
+
+    def forward(self, in_feats):
+        B, C, H, W = in_feats[0].shape            # in_feats:[2, B, C, H, W]
+        in_feats = torch.cat(in_feats, dim=1)     # in_feats:[2, C, H, W]
+        in_feats_ = in_feats.view(B, 2, C, H, W)  # in_feats_:[B, 2, C, H, W]
+        x = torch.sum(in_feats_, dim=1)           # x:[B, C, H, W]
+
+        a = self.a(self.avg_pool(x)) 
+        t = self.t(x)
+        j = torch.mul((1 - t), a) + torch.mul(t, in_feats)
+
+        j = j.view(B, 2, C, H, W)
+        j = torch.sum(j, dim=1)
+        return j
+
+#  self.pifm1 = PIFM(int(dim * 2 ** 1))
+#  x = self.pifm1([x, self.skip2(skip2)]) + x
