@@ -1,0 +1,42 @@
+class one_aware(nn.Module):
+	def __int__(self, dim, height, reduction, bias=False):
+		super(one_aware, self).__init__()
+
+		self.dim = dim
+		self.height = height
+		self.reduction = reduction
+
+		self.kt = nn.Sequential(
+			nn.Conv2d(dim, dim, kernel_size=5, padding=2, groups=dim),
+			nn.Conv2d(dim, dim//8, kernel_size=1, padding=0, bias=bias),
+			nn.ReLU(inplace=True),
+			nn.Conv2d(dim//8, dim, kernel_size=1, padding=0, bias=bias),
+			nn.Sigmoid()
+		)
+
+		self.ka = nn.Sequential(
+			nn.Conv2d(dim, dim, kernel_size=5, padding=2, groups=dim),
+			nn.AdaptiveAvgPool2d(1),
+			nn.Conv2d(dim, dim // 8, kernel_size=1, padding=0, bias=bias),
+			nn.ReLU(inplace=True),
+			nn.Conv2d(dim // 8, dim, kernel_size=1, padding=0, bias=bias),
+			nn.Sigmoid()
+		)
+
+		self.conv = nn.Sequential(
+				nn.Conv2d(dim, dim, kernel_size=3, padding=1, padding_mode='reflect'),
+				nn.ReLU(inplace=True),
+				nn.Conv2d(dim, dim, kernel_size=3, padding=1, padding_mode='reflect')
+			)
+
+	def forward(self, m):
+		B, C, H, W = m.shape
+		bias = 1
+
+		kt = self.kt(m).unsqueeze(dim=1)		# kt:[B, 1, C, H, W]
+		ka = self.ka(m).unsqueeze(dim=1)		# ka:[B, 1, C, 1, 1]
+		km = torch.cat([kt, m, ka.expand(B,1,C,H,W)],dim=1)
+
+		kn = self.conv(km)
+		j = torch.mul(kn, m-1) + bias
+		return j
