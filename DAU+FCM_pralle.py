@@ -990,3 +990,12 @@ def dehazeformer_l():
         num_heads=[2, 4, 6, 1, 1],
         attn_ratio=[1 / 4, 1 / 2, 3 / 4, 0, 0],
         conv_type=['Conv', 'Conv', 'Conv', 'Conv', 'Conv'])
+
+if __name__ == '__main__':
+    x = torch.randn((1, 3, 256, 256)).cuda()
+    net = RSFormer().cuda()
+
+    from thop import profile, clever_format
+    flops, params = profile(net, (x,))
+    flops, params = clever_format([flops, params], "%.3f")
+    print(flops, params)
