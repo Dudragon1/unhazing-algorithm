@@ -12,7 +12,6 @@ from tqdm import tqdm
 from utils import AverageMeter
 from datasets.loader import PairLoader
 from models import *
-from utils.CR import ContrastLoss_res
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--model', default='dehazeformer-t', type=str, help='model name')
@@ -42,8 +41,7 @@ def train(train_loader, network, criterion, optimizer, scaler):
 
         with autocast(args.no_autocast):
             output = network(source_img)
-            #loss = criterion[1](output, target_img)+
-            loss = criterion[0](output, target_img) + criterion[1](output, target_img, source_img) * 0.1
+            loss = criterion(output, target_img)
 
         losses.update(loss.item())
 
@@ -86,10 +84,7 @@ if __name__ == '__main__':
     network = eval(args.model.replace('-', '_'))()
     network = nn.DataParallel(network).cuda()
 
-    criterion = []
-    criterion.append(nn.SmoothL1Loss(reduction='mean'))
-    criterion.append(ContrastLoss_res(ablation=False).cuda())
-    #criterion = nn.L1Loss()
+    criterion = nn.L1Loss()
 
     if setting['optimizer'] == 'adam':
         optimizer = torch.optim.Adam(network.parameters(), lr=setting['lr'])
