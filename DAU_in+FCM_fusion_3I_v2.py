@@ -809,11 +809,11 @@ class DehazeFormer(nn.Module):
         x = self.layer3(x)
         x = self.patch_split1(x)  # C:48
 
-        x = self.fusion1([x_E1, x_E2, x_E3, x]) + x
+        x = self.fusion1([x_E1, x_E2, x_E3, x]) - x
         x = self.layer4(x)
         x = self.patch_split2(x)  # C:24
 
-        x = self.fusion2([x_E1, x_E2, x]) + x
+        x = self.fusion2([x_E1, x_E2, x]) - x
         x = self.layer5(x)
         # x = self.refine(x)
         x = self.patch_unembed(x)
