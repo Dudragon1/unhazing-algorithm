@@ -114,14 +114,18 @@ class GSA_layer(nn.Module):
                  gate_act=nn.Sigmoid):
         super(GSA_layer, self).__init__()
 
-        if len(d) != 3:
-            raise Exception('The length of d must match ERPAB.')
+        self.inconv_19 = nn.Conv2d(in_channels, in_channels, kernel_size=7, padding=9, groups=in_channels, dilation=3, padding_mode='reflect')
+        self.inconv_13 = nn.Conv2d(in_channels, in_channels, kernel_size=5, padding=6, groups=in_channels, dilation=3, padding_mode='reflect')
+        self.inconv_7 = nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=3, groups=in_channels, dilation=3, padding_mode='reflect')
 
-        self.inconv1 = nn.Conv2d(in_channels, mid_channels, kernel, stride, padding=d[0], dilation=d[0], bias=bias)
-        self.inconv2 = nn.Conv2d(in_channels, mid_channels, kernel, stride, padding=d[1], dilation=d[1], bias=bias)
-        self.inconv3 = nn.Conv2d(in_channels, mid_channels, kernel, stride, padding=d[2], dilation=d[2], bias=bias)
-        self.outconv = conv(3*mid_channels, in_channels, kernel_size=1, stride=stride, padding=0, bias=True)
+        self.outconv = conv(3*in_channels, in_channels, kernel_size=1, stride=stride, padding=0, bias=True)
 
+        self.pa = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels//8, 1, padding=0, bias=True),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_channels//8, 1, 1, padding=0, bias=True),
+            nn.Sigmoid()
+        )
         self.Wv = nn.Sequential(
             nn.Conv2d(in_channels, in_channels, 1),
             nn.Conv2d(in_channels, in_channels, kernel_size=5, padding=2, groups=in_channels, padding_mode='reflect')
@@ -135,15 +139,17 @@ class GSA_layer(nn.Module):
     def forward(self, x):
 
         input_ = x
-        x0 = self.inconv1(x)
-        x1 = self.inconv2(x)
-        x2 = self.inconv3(x)
+        x0 = self.inconv_7(x)
+        x1 = self.inconv_13(x)
+        x2 = self.inconv_19(x)
         x = torch.cat((x0, x1, x2), 1)
         x = self.outconv(x)
-        x = self.Wv(x) * self.Wg(x)
-        x = F.relu(x + input_)
+        # x = self.Wv(x) * self.Wg(x)
+        attn = self.pa(x)
+        # x = F.relu(x + input_)
+        out = input_ * attn
 
-        return x
+        return out
 
 ##########################################################################
 ##---------- Dual Attention Unit (DAU) ----------
@@ -157,17 +163,18 @@ class DAU(nn.Module):
 
         self.SA = spatial_attn_layer()
         self.CA = ResnetGlobalAttention(channel=n_feat)
+        self.GSA = GSA_layer(n_feat, n_feat)
         # self.GSA = GLU_layer(dim=n_feat)
         # self.GSA = PALayer(channel=n_feat)
 
-        self.conv1x1 = nn.Conv2d(n_feat * 2, n_feat, kernel_size=1, bias=bias)
+        self.conv1x1 = nn.Conv2d(n_feat * 3, n_feat, kernel_size=1, bias=bias)
 
     def forward(self, x):
         res = self.body(x)
         sa_branch = self.SA(res)
         ca_branch = self.CA(res)
-        # gsa_branch = self.GSA(res)
-        res = torch.cat([sa_branch, ca_branch], dim=1)
+        gsa_branch = self.GSA(res)
+        res = torch.cat([sa_branch, ca_branch, gsa_branch], dim=1)
         res = self.conv1x1(res)
         res += x
         return res
@@ -511,17 +518,7 @@ class BasicLayer(nn.Module):
                              window_size=window_size,
                              shift_size=0 if (i % 2 == 0) else window_size // 2,
                              use_attn=use_attns[i], conv_type=conv_type)
-            for i in range(depth-1)])
-        self.blocks.append(TransformerBlock(network_depth=network_depth,
-                             dim=dim,
-                             num_heads=num_heads,
-                             mlp_ratio=mlp_ratio,
-                             norm_layer=norm_layer,
-                             window_size=window_size,
-                             shift_size=0 if ((depth-1) % 2 == 0) else window_size // 2,
-                             use_attn=use_attns[(depth-1)], conv_type=conv_type,
-                             last=True)
-                           )
+            for i in range(depth)])
 
     def forward(self, x):
         # 依次通过所构建的n个TransformerBlock
