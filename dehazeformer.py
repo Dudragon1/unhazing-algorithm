@@ -14,41 +14,41 @@ def conv(in_channels, out_channels, kernel_size, bias=False, padding=1, stride=1
 
 ##########################################################################
 ##---------- Spatial Attention ----------
-class BasicConv(nn.Module):
-    def __init__(self, in_planes, out_planes, kernel_size, stride=1, padding=0, dilation=1, groups=1, relu=True,
-                 bn=False, bias=False):
-        super(BasicConv, self).__init__()
-        self.out_channels = out_planes
-        self.conv = nn.Conv2d(in_planes, out_planes, kernel_size=kernel_size, stride=stride, padding=padding,
-                              dilation=dilation, groups=groups, bias=bias)
-        self.bn = nn.BatchNorm2d(out_planes, eps=1e-5, momentum=0.01, affine=True) if bn else None
-        self.relu = nn.ReLU() if relu else None
-
-    def forward(self, x):
-        x = self.conv(x)
-        if self.bn is not None:
-            x = self.bn(x)
-        if self.relu is not None:
-            x = self.relu(x)
-        return x
-
-
 class ChannelPool(nn.Module):
     def forward(self, x):
         return torch.cat((torch.max(x, 1)[0].unsqueeze(1), torch.mean(x, 1).unsqueeze(1)), dim=1)
 
 
-class Spatial_attn_layer(nn.Module):
-    def __init__(self, kernel_size=5):
-        super(Spatial_attn_layer, self).__init__()
+class ChannelShuffle(nn.Module):
+    def __init__(self,groups):
+        super(ChannelShuffle, self).__init__()
+
+        self.groups=groups
+
+    def forward(self,x):
+        batch_size, hw, channels = x.shape
+        channels_per_group=channels//self.groups
+
+        #reshape
+        x=x.view(batch_size, hw, self.groups, channels_per_group)
+        x=torch.transpose(x,2,3).contiguous()
+
+        #flatten
+        x=x.view(batch_size,hw,-1)
+        return x
+
+class spatial_attn_layer(nn.Module):
+    def __init__(self, channel, kernel_size=5):
+        super(spatial_attn_layer, self).__init__()
+        self.DWConv = nn.Conv2d(channel, channel, 3, stride=1, padding=1, groups=channel)
         self.compress = ChannelPool()
-        ######################################
-        # DWConv的kernel大小会影响性能（1、3、5）
-        self.spatial = nn.Conv2d(2, 1, kernel_size, padding=2, groups=1, padding_mode='reflect')
+        self.spatial = nn.Conv2d(2, 1, kernel_size, stride=1, padding=(kernel_size - 1) // 2, bias=False)
+        # self.spatial = nn.Conv2d(2, 1, 1, stride=1, padding=0, bias=False)
 
     def forward(self, x):
         # import pdb;pdb.set_trace()
-        x_compress = self.compress(x)
+        x_DWC = self.DWConv(x)
+        x_compress = self.compress(x_DWC)
         x_out = self.spatial(x_compress)
         scale = torch.sigmoid(x_out)  # broadcasting
         return x * scale
@@ -56,234 +56,64 @@ class Spatial_attn_layer(nn.Module):
 
 ##########################################################################
 ## ------ Channel Attention --------------
-class ca_layer(nn.Module):
-    def __init__(self, channel, reduction=8, bias=True):
-        super(ca_layer, self).__init__()
-        # global average pooling: feature --> point
+class ResnetGlobalAttention(nn.Module):
+    def __init__(self, channel, gamma=2, b=1):
+        super(ResnetGlobalAttention, self).__init__()
+
+        self.feature_channel = channel
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        # feature channel downscale and upscale --> channel weight
-        self.conv_du = nn.Sequential(
-            nn.Conv2d(channel, channel // reduction, 1, padding=0, bias=bias),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(channel // reduction, channel, 1, padding=0, bias=bias),
-            nn.Sigmoid()
-        )
+
+        t = int(abs((math.log(channel, 2) + b) / gamma))
+        k_size = t if t % 2 else t + 1
+        self.conv = nn.Conv1d(1, 1, kernel_size=k_size, padding=(k_size - 1) // 2, bias=False)
+        self.conv_end = nn.Conv1d(1, 1, kernel_size=k_size, padding=(k_size - 1) // 2, bias=False)
+        self.soft = nn.Sigmoid()
+        # self.soft = nn.Softmax()
+
+        self.ChannelShuffle = ChannelShuffle(groups=2)
+        self.conv1 = nn.Conv2d(channel * 2, channel, 1, 1, 0)
+        self.conv2 = nn.Conv2d(channel, channel, 1, 1, 0)
 
     def forward(self, x):
         y = self.avg_pool(x)
-        y = self.conv_du(y)
-        return x * y
+        zx = y.squeeze(-1)
+        zy = zx.permute(0, 2, 1)
+        zg = torch.matmul(zy, zx)
 
+        batch = zg.shape[0]
+        v = zg.squeeze(-1).permute(1, 0).expand((self.feature_channel, batch))
+        v = v.unsqueeze_(-1).permute(1, 2, 0)
 
-##########################################################################
-## --ECA--
-class Eca_layer(nn.Module):
-    def __init__(self, channel, reduction=1, bias=True):
-        super(Eca_layer, self).__init__()
-        # global average pooling: feature --> point
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        # feature channel downscale and upscale --> channel weight
-        self.conv_du1 = nn.Sequential(
-            nn.Conv2d(channel, channel // reduction, 1, padding=0, bias=bias),
-            nn.ReLU(inplace=True),
-        )
-        self.conv_du2 = nn.Sequential(
-            nn.Conv2d(channel // reduction, channel, 1, padding=0, bias=bias),
-            nn.Sigmoid()
-        )
-        self.feature = channel
+        atten = self.conv(y.squeeze(-1).transpose(-1, -2))
+        atten = atten + v
+        atten = self.conv_end(atten)
+        atten = atten.permute(0, 2, 1).unsqueeze(-1)
+        atten_score = self.soft(atten)
 
-    def forward(self, x):
-        y = self.avg_pool(x)  # y:[B, C, 1, 1]
-        ############
-        y_Transi = y.squeeze(-1)  # y_Transi:[B, C, 1]
-        Ty = y_Transi.permute(0, 2, 1)  # Ty:[B, 1, C]
-        Ny = torch.matmul(Ty, y_Transi)  # Ny:[B, 1, 1]
-        batch = Ny.shape[0]
-        v = Ny.squeeze(-1).permute(1, 0).expand((self.feature, batch))  # [B, 1, 1]-->[B, 1]-->[1, B]-->[C, B]
-        v = v.unsqueeze_(-1).permute(1, 2, 0)  # [C, B]-->[C, B, 1]-->[B, 1, C]
-        v_GC = v.transpose(2, 1).unsqueeze(-1)  # [B, 1, C, 1]-->[B, C, 1, 1]
-        ############
-        y = self.conv_du1(y) + v_GC
-        y = self.conv_du2(y)
-        return x * y
+        return x * atten_score
 
-# --------------------------------------------------------------------------------
-# 隐式频率注意力机制
-class Fcm_layer(nn.Module):
-    def __init__(self, features, M=4, r=2, L=32) -> None:
-        super().__init__()
-
-        d = max(int(features / r), L)
-        self.features = features
-        self.convs = nn.ModuleList([])
-
-        self.conv_HF = nn.Sequential(
-            nn.Conv2d(features, features, kernel_size=3, stride=1, padding=1),
-            nn.GELU()
-        )
-
-        self.fc = nn.Conv2d(features, d, 1, 1, 0)
-        self.fcs = nn.ModuleList([])
-        for i in range(M):
-            self.fcs.append(
-                nn.Conv2d(d, features, 1, 1, 0)
-            )
-        self.softmax = nn.Softmax(dim=1)
-        self.gap = nn.AdaptiveAvgPool2d(1)
-        self.out = nn.Conv2d(features, features, 1, 1, 0)
-        self.gamma = nn.Parameter(torch.zeros((1, features, 1, 1)), requires_grad=True)
-
-    def forward(self, x):
-        # 将x划分成四个不同频率分量
-        lowlow = self.conv_HF(x)
-        low = self.conv_HF(lowlow)
-        middle = self.conv_HF(low)
-        high = self.conv_HF(middle)
-
-        emerge = low + middle + high + lowlow
-        emerge = self.gap(emerge)
-
-        fea_z = self.fc(emerge)
-
-        high_att = self.fcs[0](fea_z)
-        middle_att = self.fcs[1](fea_z)
-        low_att = self.fcs[2](fea_z)
-        lowlow_att = self.fcs[3](fea_z)
-
-        attention_vectors = torch.cat([high_att, middle_att, low_att, lowlow_att], dim=1)
-
-        attention_vectors = self.softmax(attention_vectors)
-        high_att, middle_att, low_att, lowlow_att = torch.chunk(attention_vectors, 4, dim=1)
-
-        fea_high = high * high_att
-        fea_middle = middle * middle_att
-        fea_low = low * low_att
-        fea_lowlow = lowlow * lowlow_att
-        out = fea_high + fea_middle + fea_low + fea_lowlow
-        # return out * self.gamma + x
-        return out
-
-# --------------------------------------------------------------------------------
-# 隐式频率注意力机制
-class SFconv(nn.Module):
-    def __init__(self, features, M=4, r=2, L=32, PWC_use=False) -> None:
-        super().__init__()
-
-        d = max(int(features / r), L)
-        self.features = features
-        self.DPWC_use = PWC_use
-
-        self.PWconv = nn.Conv2d(features, features, 1, bias=False)
-        self.PWconv_h = nn.Conv2d(d, features, 1, bias=False)
-        self.DWPConv = nn.Sequential(
-			nn.Conv2d(features, features, 1),
-			nn.Conv2d(features, features, kernel_size=3, padding=3//2, groups=features, padding_mode='reflect')
-		)
-        self.act = nn.ReLU(inplace=True)
-        self.convh = nn.Sequential(
-            nn.Conv2d(features, features, kernel_size=3, stride=1, padding=1),
-            nn.GELU()
-        )
-
-        self.convm = nn.Sequential(
-            nn.Conv2d(features, features, kernel_size=3, stride=1, padding=1),
-            nn.GELU()
-        )
-        self.convl = nn.Sequential(
-            nn.Conv2d(features, features, kernel_size=3, stride=1, padding=1),
-            nn.GELU()
-        )
-        self.convll = nn.Sequential(
-            nn.Conv2d(features, features, kernel_size=3, stride=1, padding=1),
-            nn.GELU()
-        )
-
-        self.fc = nn.Conv2d(features, d, 1, 1, 0)
-        self.fcs = nn.ModuleList([])
-        for i in range(M):
-            self.fcs.append(
-                nn.Conv2d(d, features, 1, 1, 0)
-            )
-        self.softmax = nn.Softmax(dim=1)
-        self.gap = nn.AdaptiveAvgPool2d(1)
-        self.out = nn.Conv2d(features, features, 1, 1, 0)
-        self.gamma = nn.Parameter(torch.zeros((1, features, 1, 1)), requires_grad=True)
-
-    def forward(self, x):
-        # x = [浅层, 深层]
-        x_sum = x[0] + x[1]
-
-        lowlow = x[1]
-        middle = x[0]
-        low = self.convl(lowlow)
-        high = self.convh(middle)
-
-        emerge = low + middle + high + lowlow
-        emerge = self.act(self.PWconv(emerge))
-        emerge = self.gap(emerge)
-
-        # 或许可以把三个FC层都换为一个DWConv+PWConv，DW关注通道，PW关注空间
-        if not self.DPWC_use:
-            fea_z = self.fc(emerge)
-            high_att = self.fcs[0](fea_z)
-            middle_att = self.fcs[1](fea_z)
-            low_att = self.fcs[2](fea_z)
-            lowlow_att = self.fcs[3](fea_z)
-        else:
-            fea_z = self.act(self.DWPConv_h(emerge))
-            high_att = self.PWconv_h(fea_z)
-            middle_att = self.PWconv_h(fea_z)
-            low_att = self.PWconv_h(fea_z)
-            lowlow_att = self.PWconv_h(fea_z)
-
-        attention_vectors = torch.cat([high_att, middle_att, low_att, lowlow_att], dim=1)
-
-        attention_vectors = self.softmax(attention_vectors)
-        high_att, middle_att, low_att, lowlow_att = torch.chunk(attention_vectors, 4, dim=1)
-
-        fea_high = high * high_att
-        fea_middle = middle * middle_att
-        fea_low = low * low_att
-        fea_lowlow = lowlow * lowlow_att
-        out = self.out(fea_high + fea_middle + fea_low + fea_lowlow)
-        return out * self.gamma + x_sum
 
 ##########################################################################
 ##---------- Dual Attention Unit (DAU) ----------
 class DAU(nn.Module):
     def __init__(
             self, n_feat, kernel_size=3, reduction=8,
-            bias=False, bn=False, act=nn.PReLU(), res_scale=1, last=False):
+            bias=False, bn=False, act=nn.PReLU(), res_scale=1):
         super(DAU, self).__init__()
-        self.last = last
         modules_body = [conv(n_feat, n_feat, kernel_size, bias=bias), act, conv(n_feat, n_feat, kernel_size, bias=bias)]
         self.body = nn.Sequential(*modules_body)
 
-        # Attention
-        self.SA = Spatial_attn_layer()
-        self.CA = ca_layer(n_feat, reduction, bias=bias)
-        self.ECA = Eca_layer(channel=n_feat, reduction=1, bias=bias)
-        self.FCM = Fcm_layer(features=n_feat)
+        self.SA = spatial_attn_layer(channel=n_feat)
+        self.CA = ResnetGlobalAttention(channel=n_feat)
 
-        self.conv1x1_2branch = nn.Conv2d(n_feat * 2, n_feat, kernel_size=1, bias=bias)
-        self.conv1x1_3branch = nn.Conv2d(n_feat * 3, n_feat, kernel_size=1, bias=bias)
-        self.gamma = nn.Parameter(torch.zeros((1, n_feat, 1, 1)), requires_grad=True)
+        self.conv1x1 = nn.Conv2d(n_feat * 2, n_feat, kernel_size=1, bias=bias)
 
     def forward(self, x):
         res = self.body(x)
-
         sa_branch = self.SA(res)
-        ca_branch = self.ECA(res)
-        # 最后一层时添加FCM
-        if self.last:
-            fa_branch = self.FCM(res)
-            ca_branch = torch.cat([ca_branch, fa_branch], dim=1)
-            res = torch.cat([sa_branch, ca_branch], dim=1)
-            res = self.conv1x1_3branch(res)
-        else:
-            res = torch.cat([sa_branch, ca_branch], dim=1)
-            res = self.conv1x1_2branch(res)
+        ca_branch = self.CA(res)
+        res = torch.cat([sa_branch, ca_branch], dim=1)
+        res = self.conv1x1(res)
         res += x
         return res
 
@@ -557,10 +387,9 @@ class TransformerBlock(nn.Module):
         self.norm2 = norm_layer(dim) if use_attn and mlp_norm else nn.Identity()  # 没用上 mlp_norm = False
 
         self.mlp = Mlp(network_depth, dim, hidden_features=int(dim * mlp_ratio))
-
+        self.bn = nn.BatchNorm2d(num_features=dim)
         #################
-        self.DAU = DAU(n_feat=dim, act=nn.ReLU(), last=self.last)
-        self.FCM = Fcm_layer(features=dim)
+        self.DAU = DAU(n_feat=dim, act=nn.ReLU())
         #################
 
     def forward(self, x):
@@ -575,11 +404,15 @@ class TransformerBlock(nn.Module):
         x = identity + x
 
         ####################
-        x = self.DAU(x)
+        # x = self.bn(x)
+        # x = self.DAU(x)
         ####################
 
         identity = x
-
+        
+        # x = self.bn(x)
+        # x = self.DAU(x)
+        
         if self.use_attn and self.mlp_norm: x, rescale, rebias = self.norm2(x)  # 没用上 mlp_norm = False
 
         x = self.mlp(x)
@@ -624,23 +457,7 @@ class BasicLayer(nn.Module):
                              window_size=window_size,
                              shift_size=0 if (i % 2 == 0) else window_size // 2,
                              use_attn=use_attns[i], conv_type=conv_type)
-            for i in range(depth - 1)])
-        #########################################
-        self.num = depth - 1
-        self.blocks.append(
-            TransformerBlock(network_depth=network_depth,
-                             dim=dim,
-                             num_heads=num_heads,
-                             mlp_ratio=mlp_ratio,
-                             norm_layer=norm_layer,
-                             window_size=window_size,
-                             shift_size=0 if (self.num % 2 == 0) else window_size // 2,
-                             use_attn=use_attns[self.num], conv_type=conv_type,
-                             last=True)
-        )
-        # self.blocks.append(SFconv(dim))
-        # self.blocks.append(nn.Conv2d(dim, dim, kernel_size=3, stride=1, padding=1))
-        #########################################
+            for i in range(depth)])
 
     def forward(self, x):
         # 依次通过所构建的n个TransformerBlock
@@ -697,96 +514,6 @@ class PatchUnEmbed(nn.Module):
 
     def forward(self, x):
         x = self.proj(x)
-        return x
-
-
-####################################
-# GLASM--下采样机制
-class Downsample(nn.Module):
-    def __init__(self, dim, num_head=8, bias=False):
-        super().__init__()
-        self.num_head = num_head
-        self.temperature = nn.Parameter(torch.ones(num_head, 1, 1))
-        # 普通下采样
-        self.v = nn.Sequential(
-            nn.Conv2d(dim, dim, kernel_size=3, stride=2, padding=1, bias=bias),
-            LayerNorm(dim),
-            nn.Conv2d(dim, dim * 2, kernel_size=1, bias=bias)
-        )
-        self.merge_v = PatchEmbed(patch_size=2, in_chans=dim, embed_dim=dim * 2)
-        self.v_hp = nn.Conv2d(dim * 2, dim * 2, kernel_size=3, stride=1, padding=1, groups=dim, bias=bias)
-        self.qk = nn.Conv2d(dim, dim * 4, kernel_size=1, bias=bias)
-        self.proj = nn.Conv2d(dim * 2, dim * 2, kernel_size=1, bias=bias)
-
-    def forward(self, x):
-        # 定义下采样后的shape
-        B, C, H, W = x.shape
-        out_shape = B, C * 2, H // 2, W // 2
-
-        # 通过卷积和转置获得[q, k]
-        qk = self.qk(x).reshape(B, 2, self.num_head, (C * 2) // self.num_head, -1).transpose(0, 1)
-        q, k = qk[0], qk[1]
-        # 常规卷积下采样，再通过
-        v = self.v(x)
-        #	v = self.merge_v(x)
-        v_hp = self.v_hp(v)
-        v = v.reshape(B, self.num_head, (C * 2) // self.num_head, -1)
-
-        attn = (q @ k.transpose(-1, -2)) * self.temperature
-        attn = attn.softmax(dim=-1)
-        x = (attn @ v).reshape(out_shape) + v_hp
-        x = self.proj(x)
-        return x
-
-
-# GLASM--上采样机制
-class Upsample(nn.Module):
-    def __init__(self, dim, num_head=8, bias=False):
-        super().__init__()
-        self.num_head = num_head
-        self.temperature = nn.Parameter(torch.ones(num_head, 1, 1))
-
-        self.v = nn.Sequential(
-            nn.ConvTranspose2d(dim, dim, kernel_size=4, stride=2, padding=1, bias=bias),
-            LayerNorm(dim),
-            nn.Conv2d(dim, dim // 2, kernel_size=1, bias=False)
-        )
-        self.split_v = PatchUnEmbed(patch_size=2, out_chans=dim // 2, embed_dim=dim)
-        self.v_hp = nn.Conv2d(dim // 2, dim // 2, kernel_size=3, stride=1, padding=1, groups=dim // 2, bias=False)
-        self.qk = nn.Conv2d(dim, dim, kernel_size=1, bias=False)
-        self.proj = nn.Conv2d(dim // 2, dim // 2, kernel_size=1, bias=False)
-
-    def forward(self, x):
-        B, C, H, W = x.shape
-        out_shape = B, C // 2, H * 2, W * 2
-
-        qk = self.qk(x).reshape(B, 2, self.num_head, (C // 2) // self.num_head, -1).transpose(0, 1)
-        q, k = qk[0], qk[1]
-
-        v = self.v(x)
-        # v = self.split_v(v)
-        v_hp = self.v_hp(v)
-        v = v.reshape(B, self.num_head, (C // 2) // self.num_head, -1)
-
-        attn = (q @ k.transpose(-1, -2)) * self.temperature
-        attn = attn.softmax(dim=-1)
-        x = (attn @ v).reshape(out_shape) + v_hp
-        x = self.proj(x)
-        return x
-
-
-class LayerNorm(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(dim))
-        self.bias = nn.Parameter(torch.zeros(dim))
-        self.eps = 1e-6
-
-    def forward(self, x):
-        u = x.mean(1, keepdim=True)
-        s = (x - u).pow(2).mean(1, keepdim=True)
-        x = (x - u) / torch.sqrt(s + self.eps)
-        x = self.weight[:, None, None] * x + self.bias[:, None, None]
         return x
 
 
@@ -859,9 +586,70 @@ class SKFF(nn.Module):
         attention_vectors = self.softmax(attention_vectors)
 
         feats_V = torch.sum(inp_feats * attention_vectors, dim=1)
+
         return feats_V
 
 
+# --------------------------------------------------------------------------------
+# 隐式频率注意力机制
+class SFconv(nn.Module):
+    def __init__(self, features, stage, M=4, r=8, L=4) -> None:
+        super().__init__()
+
+        self.stage = stage
+        d = max(int(features / r), L)
+
+        self.DWConv = nn.Conv2d(features, features, 5, padding=2, groups=1, padding_mode='reflect')
+        self.con1 = nn.Conv2d(features, features, 1)
+
+        self.mlp = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(features, d, 1, bias=False),
+            nn.ReLU(True),
+            nn.Conv2d(d, features*(stage+1), 1, 1, 0)
+        )
+        self.softmax = nn.Softmax(dim=1)
+        self.out_stage2 = nn.Conv2d(3*features, features, 1, 1, 0)
+        self.out_stage3 = nn.Conv2d(4*features, features, 1, 1, 0)
+        self.Down_DWC = nn.Sequential(
+            PatchEmbed(patch_size=2, in_chans=features//2, embed_dim=features),
+            # nn.Conv2d(features, features, 5, padding=2, groups=1, padding_mode='reflect')
+            nn.Conv2d(features, features, 1)
+        )
+
+        self.act = nn.ReLU(inplace=True)
+        self.gamma = nn.Parameter(torch.zeros((1, features, 1, 1)), requires_grad=True)
+
+
+    def forward(self, x):
+        B, C, H, W = x[-1].shape
+
+        if self.stage == 3:
+            # x = [E1, E2, E3, D3] = [24, 24, 48, 48]
+            x_E1 = self.Down_DWC(x[0])
+            x_E2 = self.Down_DWC(x[1])
+            x_E3 = self.con1(x[2])
+            x_D3 = x[3]
+            emerge = torch.cat([x_E1, x_E2, x_E3, x_D3], 1)
+            x_value = emerge
+            emerge = self.out_stage3(emerge)
+            # emerge = self.mix2(x_E1) + self.mix2(x_E2) + self.mix2(x_E3) + self.mix2(x_D3)
+        if self.stage == 2:
+            # x = [E1, E2, D2] = [24, 24, 24]
+            x_E1 = self.con1(x[0])
+            x_E2 = self.con1(x[1])
+            x_D2 = x[2]
+            emerge = torch.cat([x_E1, x_E2, x_D2], 1)
+            x_value = emerge
+            emerge = self.out_stage2(emerge)
+            # emerge = self.mix2(x_E1) + self.mix2(x_E2) + self.mix2(x_D2)
+
+        x_value = x_value.view(B, self.stage + 1, C, H, W)
+        emerge = self.mlp(emerge)
+        emerge = self.softmax(emerge.view(B, self.stage+1, C, 1, 1))
+        out = torch.sum(x_value*emerge, dim=1)
+
+        return out
 
 ################################################
 # 模型框架
@@ -930,7 +718,8 @@ class DehazeFormer(nn.Module):
         #     dim=embed_dims[2], num_head=8)
 
         assert embed_dims[1] == embed_dims[3]
-        self.fusion1 = SFconv(embed_dims[3])
+        self.fusion1 = SFconv(features=embed_dims[3], stage=3)
+        # self.fusion1 = SKFusion(embed_dims[3])
 
         self.layer4 = BasicLayer(network_depth=sum(depths), dim=embed_dims[3], depth=depths[3],
                                  num_heads=num_heads[3], mlp_ratio=mlp_ratios[3],
@@ -943,7 +732,8 @@ class DehazeFormer(nn.Module):
         #     dim=embed_dims[3], num_head=8)
 
         assert embed_dims[0] == embed_dims[4]
-        self.fusion2 = SFconv(embed_dims[4])
+        self.fusion2 = SFconv(features=embed_dims[4], stage=2)
+        # self.fusion2 = SKFusion(embed_dims[4])
 
         self.layer5 = BasicLayer(network_depth=sum(depths), dim=embed_dims[4], depth=depths[4],
                                  num_heads=num_heads[4], mlp_ratio=mlp_ratios[4],
@@ -973,26 +763,51 @@ class DehazeFormer(nn.Module):
 
     def forward_features(self, x):
         x = self.patch_embed(x)  # C:24
+        x_E1 = x
         x = self.layer1(x)
-        skip1 = x
+        x_E2 = x
 
         x = self.patch_merge1(x)  # C:48
         x = self.layer2(x)
-        skip2 = x
+        x_E3 = x
 
         x = self.patch_merge2(x)  # C:96
         x = self.layer3(x)
         x = self.patch_split1(x)  # C:48
 
-        x = self.fusion1([x, self.skip2(skip2)]) + x
+        x = self.fusion1([x_E1, x_E2, x_E3, x]) - x
+        # x = self.fusion1([x, self.skip2(x_E3)]) + x
         x = self.layer4(x)
         x = self.patch_split2(x)  # C:24
 
-        x = self.fusion2([x, self.skip1(skip1)]) + x
+        x = self.fusion2([x_E1, x_E2, x]) - x
+        # x = self.fusion2([x, self.skip1(x_E2)]) + x
         x = self.layer5(x)
         # x = self.refine(x)
         x = self.patch_unembed(x)
         return x
+
+#     def forward_features(self, x):
+#             x = self.patch_embed(x)
+#             x = self.layer1(x)
+#             skip1 = x
+
+#             x = self.patch_merge1(x)
+#             x = self.layer2(x)
+#             skip2 = x
+
+#             x = self.patch_merge2(x)
+#             x = self.layer3(x)
+#             x = self.patch_split1(x)
+
+#             x = self.fusion1([x, self.skip2(skip2)]) + x
+#             x = self.layer4(x)
+#             x = self.patch_split2(x)
+
+#             x = self.fusion2([x, self.skip1(skip1)]) + x
+#             x = self.layer5(x)
+#             x = self.patch_unembed(x)
+#             return x
 
     def forward(self, x):
         H, W = x.shape[2:]
@@ -1081,8 +896,9 @@ def dehazeformer_l():
         conv_type=['Conv', 'Conv', 'Conv', 'Conv', 'Conv'])
 
 if __name__ == '__main__':
-    x = torch.randn((1, 3, 256, 256)).cuda()
-    net = DehazeFormer(depths=[2, 4, 6, 1, 1]).cuda()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    x = torch.randn((1, 3, 256, 256)).to(device)
+    net = dehazeformer_t().to(device)
 
     from thop import profile, clever_format
     flops, params = profile(net, (x,))
