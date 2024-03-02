@@ -19,39 +19,45 @@ class ChannelPool(nn.Module):
         return torch.cat((torch.max(x, 1)[0].unsqueeze(1), torch.mean(x, 1).unsqueeze(1)), dim=1)
 
 
-class ChannelShuffle(nn.Module):
-    def __init__(self,groups):
-        super(ChannelShuffle, self).__init__()
+class BasicConv_DAU(nn.Module):
+    def __init__(self, in_planes, out_planes, kernel_size, stride=1, padding=0, dilation=1, groups=1, relu=True, bn=False, bias=False):
+        super(BasicConv_DAU, self).__init__()
+        self.out_channels = out_planes
+        self.conv = nn.Conv2d(in_planes, out_planes, kernel_size=kernel_size, stride=stride, padding=padding, dilation=dilation, groups=groups, bias=bias)
+        self.bn = nn.BatchNorm2d(out_planes,eps=1e-5, momentum=0.01, affine=True) if bn else None
+        self.relu = nn.ReLU() if relu else None
 
-        self.groups=groups
-
-    def forward(self,x):
-        batch_size, hw, channels = x.shape
-        channels_per_group=channels//self.groups
-
-        #reshape
-        x=x.view(batch_size, hw, self.groups, channels_per_group)
-        x=torch.transpose(x,2,3).contiguous()
-
-        #flatten
-        x=x.view(batch_size,hw,-1)
+    def forward(self, x):
+        x = self.conv(x)
+        if self.bn is not None:
+            x = self.bn(x)
+        if self.relu is not None:
+            x = self.relu(x)
         return x
 
+
 class spatial_attn_layer(nn.Module):
-    def __init__(self, channel, kernel_size=5):
+    def __init__(self, n_feat, kernel_size=5, DWkernel=5, pad=4):
         super(spatial_attn_layer, self).__init__()
-        self.DWConv = nn.Conv2d(channel, channel, 3, stride=1, padding=1, groups=channel)
         self.compress = ChannelPool()
-        self.spatial = nn.Conv2d(2, 1, kernel_size, stride=1, padding=(kernel_size - 1) // 2, bias=False)
-        # self.spatial = nn.Conv2d(2, 1, 1, stride=1, padding=0, bias=False)
+        self.spatial = BasicConv_DAU(2, 1, kernel_size, stride=1, padding=(kernel_size - 1) // 2, relu=False)
+        self.Dconv = nn.Conv2d(n_feat, n_feat, DWkernel, stride=1, dilation=2, padding=pad, groups=n_feat)
+
+        # self.Dconv = nn.Sequential(
+        #     nn.Conv2d(n_feat, n_feat, 5, stride=1, dilation=2, padding=4, groups=n_feat),
+        #     nn.Conv2d(n_feat, n_feat, 7, stride=1, dilation=3, padding=9, groups=n_feat)
+        # )
+        # self.spatial = DepthWiseConv(2, 1, kernel=5)
 
     def forward(self, x):
         # import pdb;pdb.set_trace()
-        x_DWC = self.DWConv(x)
-        x_compress = self.compress(x_DWC)
+        x_compress = self.compress(x)
         x_out = self.spatial(x_compress)
         scale = torch.sigmoid(x_out)  # broadcasting
-        return x * scale
+        x_dw = self.Dconv(x)
+        out = x_dw * scale
+
+        return out
 
 
 ##########################################################################
@@ -70,7 +76,7 @@ class ResnetGlobalAttention(nn.Module):
         self.soft = nn.Sigmoid()
         # self.soft = nn.Softmax()
 
-        self.ChannelShuffle = ChannelShuffle(groups=2)
+
         self.conv1 = nn.Conv2d(channel * 2, channel, 1, 1, 0)
         self.conv2 = nn.Conv2d(channel, channel, 1, 1, 0)
 
@@ -98,12 +104,12 @@ class ResnetGlobalAttention(nn.Module):
 class DAU(nn.Module):
     def __init__(
             self, n_feat, kernel_size=3, reduction=8,
-            bias=False, bn=False, act=nn.PReLU(), res_scale=1):
+            bias=False, bn=False, act=nn.PReLU(), res_scale=1, DWkernel=5, pad=4):
         super(DAU, self).__init__()
-        modules_body = [conv(n_feat, n_feat, kernel_size, bias=bias), act, conv(n_feat, n_feat, kernel_size, bias=bias)]
+        modules_body = [conv(n_feat, n_feat//reduction, kernel_size, bias=bias), act, conv(n_feat//reduction, n_feat, kernel_size, bias=bias)]
         self.body = nn.Sequential(*modules_body)
 
-        self.SA = spatial_attn_layer(channel=n_feat)
+        self.SA = spatial_attn_layer(n_feat=n_feat, DWkernel=DWkernel, pad=pad)
         self.CA = ResnetGlobalAttention(channel=n_feat)
 
         self.conv1x1 = nn.Conv2d(n_feat * 2, n_feat, kernel_size=1, bias=bias)
@@ -389,7 +395,7 @@ class TransformerBlock(nn.Module):
         self.mlp = Mlp(network_depth, dim, hidden_features=int(dim * mlp_ratio))
         self.bn = nn.BatchNorm2d(num_features=dim)
         #################
-        self.DAU = DAU(n_feat=dim, act=nn.ReLU())
+        self.DAU = DAU(n_feat=dim, act=nn.ReLU(), reduction=1, DWkernel=5, pad=4)
         #################
 
     def forward(self, x):
@@ -404,15 +410,14 @@ class TransformerBlock(nn.Module):
         x = identity + x
 
         ####################
-        # x = self.bn(x)
-        # x = self.DAU(x)
+        x = self.bn(x)
+        x = self.DAU(x)
         ####################
 
         identity = x
-        
-        # x = self.bn(x)
-        # x = self.DAU(x)
-        
+
+
+
         if self.use_attn and self.mlp_norm: x, rescale, rebias = self.norm2(x)  # 没用上 mlp_norm = False
 
         x = self.mlp(x)
@@ -517,8 +522,6 @@ class PatchUnEmbed(nn.Module):
         return x
 
 
-#################################################
-# 选择融合机制
 class SKFusion(nn.Module):
     def __init__(self, dim, height=2, reduction=8):
         super(SKFusion, self).__init__()
@@ -536,13 +539,12 @@ class SKFusion(nn.Module):
         self.softmax = nn.Softmax(dim=1)
 
     def forward(self, in_feats):
-        # in_feats = [x, skip_x] x为上采样后的输出，skip是对应scale层下采样的输出,两者的shape都为[B, embed_dims[i], H, W]
         B, C, H, W = in_feats[0].shape
 
-        in_feats = torch.cat(in_feats, dim=1)  # 将两个输入合并 in_feats.shape = [B, 2*embed_dims[i], H, W]
-        in_feats = in_feats.view(B, self.height, C, H, W)  # in_feats.shape = [B, 2, embed_dims[i], H, W]
+        in_feats = torch.cat(in_feats, dim=1)
+        in_feats = in_feats.view(B, self.height, C, H, W)
 
-        feats_sum = torch.sum(in_feats, dim=1)  # in_feats.shape = [B, embed_dims[i], H, W]
+        feats_sum = torch.sum(in_feats, dim=1)
         attn = self.mlp(self.avg_pool(feats_sum))
         attn = self.softmax(attn.view(B, self.height, C, 1, 1))
 
@@ -550,47 +552,7 @@ class SKFusion(nn.Module):
         return out
 
 
-##############################
-# SKFF
-class SKFF(nn.Module):
-    def __init__(self, dim, height=2, reduction=8, bias=False):
-        super(SKFF, self).__init__()
-
-        self.height = height
-        d = max(int(dim / reduction), 4)
-
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.conv_du = nn.Sequential(nn.Conv2d(dim, d, 1, padding=0, bias=bias), nn.PReLU())
-
-        self.fcs = nn.ModuleList([])
-        for i in range(self.height):
-            self.fcs.append(nn.Conv2d(d, dim, kernel_size=1, stride=1, bias=bias))
-
-        self.softmax = nn.Softmax(dim=1)
-
-    def forward(self, inp_feats):
-        batch_size = inp_feats[0].shape[0]
-        n_feats = inp_feats[0].shape[1]
-
-        inp_feats = torch.cat(inp_feats, dim=1)
-        inp_feats = inp_feats.view(batch_size, self.height, n_feats, inp_feats.shape[2], inp_feats.shape[3])
-
-        feats_U = torch.sum(inp_feats, dim=1)
-        feats_S = self.avg_pool(feats_U)
-        feats_Z = self.conv_du(feats_S)
-
-        attention_vectors = [fc(feats_Z) for fc in self.fcs]
-        attention_vectors = torch.cat(attention_vectors, dim=1)
-        attention_vectors = attention_vectors.view(batch_size, self.height, n_feats, 1, 1)
-        # stx()
-        attention_vectors = self.softmax(attention_vectors)
-
-        feats_V = torch.sum(inp_feats * attention_vectors, dim=1)
-
-        return feats_V
-
-
-# --------------------------------------------------------------------------------
+    # --------------------------------------------------------------------------------
 # 隐式频率注意力机制
 class SFconv(nn.Module):
     def __init__(self, features, stage, M=4, r=8, L=4) -> None:
@@ -602,24 +564,22 @@ class SFconv(nn.Module):
         self.DWConv = nn.Conv2d(features, features, 5, padding=2, groups=1, padding_mode='reflect')
         self.con1 = nn.Conv2d(features, features, 1)
 
-        self.mlp = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(features, d, 1, bias=False),
-            nn.ReLU(True),
-            nn.Conv2d(d, features*(stage+1), 1, 1, 0)
-        )
-        self.softmax = nn.Softmax(dim=1)
-        self.out_stage2 = nn.Conv2d(3*features, features, 1, 1, 0)
-        self.out_stage3 = nn.Conv2d(4*features, features, 1, 1, 0)
+        # self.SA = spatial_attn_layer(n_feat=features)
+        # self.CA = ResnetGlobalAttention(channel=features)
+        # self.conv1x1 = nn.Conv2d(features * 2, features, kernel_size=1, bias=False)
+        self.DAU = DAU(n_feat=features, act=nn.ReLU(), reduction=1, DWkernel=5, pad=4)
+        self.norm = nn.BatchNorm2d(features)
+
+        self.out_stage2 = nn.Conv2d(3 * features, features, 1, 1, 0)
+        self.out_stage3 = nn.Conv2d(4 * features, features, 1, 1, 0)
         self.Down_DWC = nn.Sequential(
-            PatchEmbed(patch_size=2, in_chans=features//2, embed_dim=features),
+            PatchEmbed(patch_size=2, in_chans=features // 2, embed_dim=features),
             # nn.Conv2d(features, features, 5, padding=2, groups=1, padding_mode='reflect')
             nn.Conv2d(features, features, 1)
         )
 
         self.act = nn.ReLU(inplace=True)
         self.gamma = nn.Parameter(torch.zeros((1, features, 1, 1)), requires_grad=True)
-
 
     def forward(self, x):
         B, C, H, W = x[-1].shape
@@ -638,18 +598,19 @@ class SFconv(nn.Module):
             # x = [E1, E2, D2] = [24, 24, 24]
             x_E1 = self.con1(x[0])
             x_E2 = self.con1(x[1])
+            # x_E1 = x[0]
+            # x_E2 = x[1]
             x_D2 = x[2]
             emerge = torch.cat([x_E1, x_E2, x_D2], 1)
             x_value = emerge
             emerge = self.out_stage2(emerge)
             # emerge = self.mix2(x_E1) + self.mix2(x_E2) + self.mix2(x_D2)
 
-        x_value = x_value.view(B, self.stage + 1, C, H, W)
-        emerge = self.mlp(emerge)
-        emerge = self.softmax(emerge.view(B, self.stage+1, C, 1, 1))
-        out = torch.sum(x_value*emerge, dim=1)
+        emerge = self.norm(emerge)
+        out = self.DAU(emerge)
 
         return out
+
 
 ################################################
 # 模型框架
@@ -783,31 +744,30 @@ class DehazeFormer(nn.Module):
         x = self.fusion2([x_E1, x_E2, x]) - x
         # x = self.fusion2([x, self.skip1(x_E2)]) + x
         x = self.layer5(x)
-        # x = self.refine(x)
         x = self.patch_unembed(x)
         return x
 
-#     def forward_features(self, x):
-#             x = self.patch_embed(x)
-#             x = self.layer1(x)
-#             skip1 = x
+    #     def forward_features(self, x):
+    #             x = self.patch_embed(x)
+    #             x = self.layer1(x)
+    #             skip1 = x
 
-#             x = self.patch_merge1(x)
-#             x = self.layer2(x)
-#             skip2 = x
+    #             x = self.patch_merge1(x)
+    #             x = self.layer2(x)
+    #             skip2 = x
 
-#             x = self.patch_merge2(x)
-#             x = self.layer3(x)
-#             x = self.patch_split1(x)
+    #             x = self.patch_merge2(x)
+    #             x = self.layer3(x)
+    #             x = self.patch_split1(x)
 
-#             x = self.fusion1([x, self.skip2(skip2)]) + x
-#             x = self.layer4(x)
-#             x = self.patch_split2(x)
+    #             x = self.fusion1([x, self.skip2(skip2)]) + x
+    #             x = self.layer4(x)
+    #             x = self.patch_split2(x)
 
-#             x = self.fusion2([x, self.skip1(skip1)]) + x
-#             x = self.layer5(x)
-#             x = self.patch_unembed(x)
-#             return x
+    #             x = self.fusion2([x, self.skip1(skip1)]) + x
+    #             x = self.layer5(x)
+    #             x = self.patch_unembed(x)
+    #             return x
 
     def forward(self, x):
         H, W = x.shape[2:]
@@ -895,12 +855,14 @@ def dehazeformer_l():
         attn_ratio=[1 / 4, 1 / 2, 3 / 4, 0, 0],
         conv_type=['Conv', 'Conv', 'Conv', 'Conv', 'Conv'])
 
+
 if __name__ == '__main__':
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     x = torch.randn((1, 3, 256, 256)).to(device)
-    net = dehazeformer_t().to(device)
+    net = dehazeformer_s().to(device)
 
     from thop import profile, clever_format
+
     flops, params = profile(net, (x,))
     flops, params = clever_format([flops, params], "%.3f")
     print(flops, params)
