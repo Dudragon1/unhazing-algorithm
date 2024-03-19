@@ -58,10 +58,16 @@ class ChannelPool(nn.Module):
         return torch.cat( (torch.max(x,1)[0].unsqueeze(1), torch.mean(x,1).unsqueeze(1)), dim=1 )
 
 class spatial_attn_layer(nn.Module):
-    def __init__(self, kernel_size=5):
+    def __init__(self, n_feat, kernel_size=5):
         super(spatial_attn_layer, self).__init__()
         self.compress = ChannelPool()
         self.spatial = BasicConv_DAU(2, 1, kernel_size, stride=1, padding=(kernel_size - 1) // 2, relu=False)
+        self.Dconv = nn.Conv2d(n_feat, n_feat, 5, stride=1, dilation=2, padding=4, groups=n_feat)
+
+        # self.Dconv = nn.Sequential(
+        #     nn.Conv2d(n_feat, n_feat, 5, stride=1, dilation=2, padding=4, groups=n_feat),
+        #     nn.Conv2d(n_feat, n_feat, 7, stride=1, dilation=3, padding=9, groups=n_feat)
+        # )
         # self.spatial = DepthWiseConv(2, 1, kernel=5)
 
     def forward(self, x):
@@ -69,29 +75,71 @@ class spatial_attn_layer(nn.Module):
         x_compress = self.compress(x)
         x_out = self.spatial(x_compress)
         scale = torch.sigmoid(x_out)  # broadcasting
-        return x * scale
+        x_dw = self.Dconv(x)
+        out = x_dw * scale
 
+        return out
 
-class SELayer(nn.Module):
-    def __init__(self, channel, reduction=16):
-        super(SELayer, self).__init__()
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)  # 全局平均池化，输入BCHW -> 输出 B*C*1*1
-        self.fc = nn.Sequential(
-            nn.Linear(channel, channel // reduction, bias=False),  # 可以看到channel得被reduction整除，否则可能出问题
-            nn.ReLU(inplace=True),
-            nn.Linear(channel // reduction, channel, bias=False),
-            nn.Sigmoid()
-        )
+##########################################################################
+## --NECA--
+class ResnetGlobalAttention(nn.Module):
+    def __init__(self, n_feat, gamma=2, b=1):
+        super(ResnetGlobalAttention, self).__init__()
+
+        self.feature_channel = n_feat
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        t = int(abs((math.log(n_feat, 2) + b) / gamma))
+        k_size = t if t % 2 else t + 1
+        self.conv = nn.Conv1d(1, 1, kernel_size=k_size, padding=(k_size - 1) // 2, bias=False)
+        self.conv_end = nn.Conv1d(1, 1, kernel_size=k_size, padding=(k_size - 1) // 2, bias=False)
+        self.soft = nn.Sigmoid()
+
 
     def forward(self, x):
-        b, c, _, _ = x.size()
-        y = self.avg_pool(x).view(b, c)  # 得到B*C*1*1,然后转成B*C，才能送入到FC层中。
-        y = self.fc(y).view(b, c, 1, 1)  # 得到B*C的向量，C个值就表示C个通道的权重。把B*C变为B*C*1*1是为了与四维的x运算。
-        return x * y.expand_as(x)
+        y = self.avg_pool(x)
 
+        zx = y.squeeze(-1)
+        zy = zx.permute(0, 2, 1)
+        zg = torch.matmul(zy, zx)
 
+        batch = zg.shape[0]
+        v = zg.squeeze(-1).permute(1, 0).expand((self.feature_channel, batch))
+        v = v.unsqueeze_(-1).permute(1, 2, 0)
 
+        atten = self.conv(y.squeeze(-1).transpose(-1, -2))
+        atten = atten + v
+        atten = self.conv_end(atten)
+        atten = atten.permute(0,2,1).unsqueeze(-1)
 
+        atten_score = self.soft(atten)
+        out = x * atten_score
+
+        return out
+
+##########################################################################
+##---------- Dual Attention Unit (DAU) ----------
+class DAU(nn.Module):
+    def __init__(
+            self, n_feat, kernel_size=3, reduction=8,
+            bias=False, bn=False, act=nn.PReLU(), res_scale=1):
+        super(DAU, self).__init__()
+        modules_body = [conv(n_feat, n_feat, kernel_size, bias=bias), act, conv(n_feat, n_feat, kernel_size, bias=bias)]
+        self.body = nn.Sequential(*modules_body)
+
+        self.SA = spatial_attn_layer(n_feat)
+        self.CA = ResnetGlobalAttention(n_feat=n_feat)
+
+        self.conv1x1 = nn.Conv2d(n_feat*2, n_feat, kernel_size=1, bias=bias)
+
+    def forward(self, x):
+        res = self.body(x)
+        sa_branch = self.SA(res)
+        ca_branch = self.CA(res)
+
+        res = torch.cat([sa_branch, ca_branch], dim=1)
+        res = self.conv1x1(res)
+        res += x
+        return res
 
 class RLN(nn.Module):
     r"""RescaleNorm替换了模型中的所有Layernorm"""
@@ -362,8 +410,7 @@ class TransformerBlock(nn.Module):
         self.mlp = Mlp(network_depth, dim, hidden_features=int(dim * mlp_ratio))
 
         #################
-        # self.DAU = DAU(n_feat=dim, act=nn.ReLU())
-        self.SE = SELayer(channel=dim, reduction=8)
+        self.DAU = DAU(n_feat=dim, act=nn.ReLU())
         #################
 
     def forward(self, x):
@@ -378,7 +425,7 @@ class TransformerBlock(nn.Module):
         x = identity + x
 
         ####################
-        x = self.SE(x)
+        x = self.DAU(x)
         ####################
 
         identity = x
@@ -596,7 +643,10 @@ class DehazeFormer(nn.Module):
         # self.patch_merge1 = Downsample(
         #     dim=embed_dims[0], num_head=8)
 
-
+        ####################
+        # DAU模块，与SKFF级联使用
+        self.DAU_SKFF1 = DAU(n_feat=embed_dims[0], act=nn.ReLU())
+        self.DAU_SKFF2 = DAU(n_feat=embed_dims[1], act=nn.ReLU())
 
         self.skip1 = nn.Conv2d(embed_dims[0], embed_dims[0], 1)
 
